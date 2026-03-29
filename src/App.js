@@ -1,6 +1,26 @@
 import React, { useState, useEffect, useRef } from 'react';
 import SimplePeer from 'simple-peer';
 import './App.css';
+import { initializeApp } from "firebase/app";
+import { getDatabase, ref, push, onValue, set, remove, serverTimestamp } from "firebase/database";
+
+// ============================================
+// FIREBASE CONFIGURATION
+// ============================================
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCJFeafEzvNsoK50dEAd9QcEYcUm1GCk-o",
+  authDomain: "chat-app-private-45321.firebaseapp.com",
+  projectId: "chat-app-private-45321",
+  storageBucket: "chat-app-private-45321.firebasestorage.app",
+  messagingSenderId: "459816028295",
+  appId: "1:459816028295:web:29d428b1c15cddcf959022",
+  databaseURL: "https://chat-app-private-45321-default-rtdb.firebaseio.com"
+};
+
+// Initialize Firebase
+const firebaseApp = initializeApp(firebaseConfig);
+const database = getDatabase(firebaseApp);
 
 // ============================================
 // USERS DATA
@@ -26,29 +46,129 @@ export default function ChatApp() {
   const [messageInput, setMessageInput] = useState('');
   const [incomingCall, setIncomingCall] = useState(null);
   const [activeCall, setActiveCall] = useState(null);
+  const [callDuration, setCallDuration] = useState(0);
+
   const peerRef = useRef(null);
   const localStreamRef = useRef(null);
-
+  const messagesUnsubscribe = useRef(null);
+  const callsUnsubscribe = useRef(null);
+  const usersUnsubscribe = useRef(null);
 
   // ============================================
-  // SOCKET CONNECTION
+  // LISTEN TO ONLINE USERS
   // ============================================
 
   useEffect(() => {
-    if (currentUser) {
-      // Initialize local state for online users
-      const allUserIds = USERS.map(u => u.id);
-      setOnlineUsers(allUserIds);
+    if (!currentUser) return;
 
-      // Simulate real-time updates
-      const interval = setInterval(() => {
-        // Randomly toggle user online status for demo
-        // In production, this would be handled by WebSocket
-      }, 5000);
+    // Mark current user as online
+    const userRef = ref(database, `users/${currentUser.id}`);
+    set(userRef, {
+      id: currentUser.id,
+      name: currentUser.name,
+      online: true,
+      timestamp: serverTimestamp(),
+    });
 
-      return () => clearInterval(interval);
-    }
+    // Listen to all online users
+    const usersRef = ref(database, 'users');
+    const unsubscribe = onValue(usersRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const onlineUserIds = Object.keys(data).map(key => parseInt(key));
+        setOnlineUsers(onlineUserIds.filter(id => id !== currentUser.id));
+      }
+    });
+
+    usersUnsubscribe.current = unsubscribe;
+
+    // Cleanup on logout
+    return () => {
+      if (unsubscribe) unsubscribe();
+      remove(userRef);
+    };
   }, [currentUser]);
+
+  // ============================================
+  // LISTEN TO MESSAGES
+  // ============================================
+
+  useEffect(() => {
+    if (!currentUser || !selectedUser) return;
+
+    const chatId = Math.min(currentUser.id, selectedUser.id) + '_' + Math.max(currentUser.id, selectedUser.id);
+    const messagesRef = ref(database, `messages/${chatId}`);
+
+    const unsubscribe = onValue(messagesRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const messagesList = Object.entries(data).map(([key, value]) => ({
+          id: key,
+          ...value
+        }));
+        setMessages(messagesList.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0)));
+      } else {
+        setMessages([]);
+      }
+    });
+
+    messagesUnsubscribe.current = unsubscribe;
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [currentUser, selectedUser]);
+
+  // ============================================
+  // LISTEN TO INCOMING CALLS
+  // ============================================
+
+  useEffect(() => {
+    if (!currentUser) return;
+
+    const callsRef = ref(database, `calls/${currentUser.id}`);
+
+    const unsubscribe = onValue(callsRef, (snapshot) => {
+      const data = snapshot.val();
+      if (data) {
+        const latestCall = Object.entries(data).pop();
+        if (latestCall) {
+          const [key, callData] = latestCall;
+          if (callData.type === 'incoming' && !incomingCall) {
+            setIncomingCall({
+              from: callData.fromId,
+              fromName: callData.fromName,
+              fromAvatar: callData.fromAvatar,
+              offer: callData.offer,
+              callId: key,
+            });
+          }
+        }
+      }
+    });
+
+    callsUnsubscribe.current = unsubscribe;
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [currentUser, incomingCall]);
+
+  // ============================================
+  // CALL DURATION TIMER
+  // ============================================
+
+  useEffect(() => {
+    let interval;
+    if (activeCall) {
+      interval = setInterval(() => {
+        setCallDuration(prev => prev + 1);
+      }, 1000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [activeCall]);
 
   // ============================================
   // AUTH FUNCTIONS
@@ -58,12 +178,7 @@ export default function ChatApp() {
     const user = USERS.find(u => u.username === username && u.password === password);
     if (user) {
       setCurrentUser(user);
-      localStorage.setItem('currentUser', JSON.stringify(user));
-      // Load saved messages from localStorage
-      const savedMessages = localStorage.getItem('messages');
-      if (savedMessages) {
-        setMessages(JSON.parse(savedMessages));
-      }
+      setMessages([]);
       return true;
     }
     return false;
@@ -73,53 +188,53 @@ export default function ChatApp() {
     if (activeCall) {
       endCall();
     }
+    if (messagesUnsubscribe.current) messagesUnsubscribe.current();
+    if (callsUnsubscribe.current) callsUnsubscribe.current();
+    if (usersUnsubscribe.current) usersUnsubscribe.current();
+    
     setCurrentUser(null);
     setSelectedUser(null);
     setIncomingCall(null);
-    localStorage.removeItem('currentUser');
+    setMessages([]);
   };
 
   // ============================================
   // CHAT FUNCTIONS
   // ============================================
 
-  const sendMessage = (e) => {
+  const sendMessage = async (e) => {
     e?.preventDefault();
-    if (!messageInput.trim() || !selectedUser) return;
+    if (!messageInput.trim() || !selectedUser || !currentUser) return;
 
-    const newMessage = {
-      id: Date.now(),
-      senderId: currentUser.id,
-      senderName: currentUser.name,
-      senderAvatar: currentUser.avatar,
-      recipientId: selectedUser.id,
-      text: messageInput,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      date: new Date().toLocaleDateString(),
-    };
+    try {
+      const chatId = Math.min(currentUser.id, selectedUser.id) + '_' + Math.max(currentUser.id, selectedUser.id);
+      const messagesRef = ref(database, `messages/${chatId}`);
 
-    const updatedMessages = [...messages, newMessage];
-    setMessages(updatedMessages);
-    localStorage.setItem('messages', JSON.stringify(updatedMessages));
-    setMessageInput('');
+      await push(messagesRef, {
+        senderId: currentUser.id,
+        senderName: currentUser.name,
+        senderAvatar: currentUser.avatar,
+        text: messageInput,
+        timestamp: serverTimestamp(),
+      });
+
+      setMessageInput('');
+    } catch (error) {
+      console.error('Error sending message:', error);
+      alert('Error sending message. Please try again.');
+    }
   };
 
-  const getConversationMessages = () => {
-    if (!selectedUser) return [];
-    return messages.filter(m => 
-      (m.senderId === currentUser.id && m.recipientId === selectedUser.id) ||
-      (m.senderId === selectedUser.id && m.recipientId === currentUser.id)
-    ).sort((a, b) => a.id - b.id);
-  };
+  const clearChat = async () => {
+    if (!window.confirm('Clear all messages with this user?')) return;
 
-  const clearChat = () => {
-    if (window.confirm('Clear all messages with this user?')) {
-      const updatedMessages = messages.filter(m =>
-        !((m.senderId === currentUser.id && m.recipientId === selectedUser.id) ||
-          (m.senderId === selectedUser.id && m.recipientId === currentUser.id))
-      );
-      setMessages(updatedMessages);
-      localStorage.setItem('messages', JSON.stringify(updatedMessages));
+    try {
+      const chatId = Math.min(currentUser.id, selectedUser.id) + '_' + Math.max(currentUser.id, selectedUser.id);
+      const messagesRef = ref(database, `messages/${chatId}`);
+      await remove(messagesRef);
+      setMessages([]);
+    } catch (error) {
+      console.error('Error clearing chat:', error);
     }
   };
 
@@ -128,7 +243,7 @@ export default function ChatApp() {
   // ============================================
 
   const initiateCall = async (targetUser) => {
-    if (!targetUser) return;
+    if (!targetUser || !currentUser) return;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -149,17 +264,19 @@ export default function ChatApp() {
 
       peerRef.current = peer;
 
-      peer.on('signal', (offer) => {
-        // In production, send this via WebSocket to the target user
-        console.log('Call offer generated');
-        // Simulate incoming call notification on the other user
-        setIncomingCall({
-          from: currentUser.id,
-          fromName: currentUser.name,
-          fromAvatar: currentUser.avatar,
-          offer: offer,
-          targetId: targetUser.id,
-        });
+      peer.on('signal', async (offer) => {
+        try {
+          const callsRef = ref(database, `calls/${targetUser.id}`);
+          await push(callsRef, {
+            type: 'incoming',
+            fromId: currentUser.id,
+            fromName: currentUser.name,
+            fromAvatar: currentUser.avatar,
+            offer: JSON.stringify(offer),
+          });
+        } catch (error) {
+          console.error('Error sending call offer:', error);
+        }
       });
 
       peer.on('stream', (remoteStream) => {
@@ -181,55 +298,69 @@ export default function ChatApp() {
         targetUserName: targetUser.name,
         targetUserAvatar: targetUser.avatar,
       });
+      setCallDuration(0);
     } catch (err) {
       alert('Microphone access denied. Please allow microphone access in browser settings.');
     }
   };
 
-  const acceptCall = () => {
-    if (!incomingCall) return;
+  const acceptCall = async () => {
+    if (!incomingCall || !currentUser) return;
 
     try {
-      navigator.mediaDevices.getUserMedia({
+      const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
         },
         video: false,
-      }).then(stream => {
-        localStreamRef.current = stream;
-
-        const peer = new SimplePeer({
-          initiator: false,
-          trickleIce: false,
-          stream: stream,
-        });
-
-        peerRef.current = peer;
-
-        peer.on('signal', (answer) => {
-          console.log('Call answer sent');
-        });
-
-        peer.on('stream', (remoteStream) => {
-          console.log('Remote stream received');
-        });
-
-        peer.on('error', (err) => {
-          console.error('Peer error:', err);
-          endCall();
-        });
-
-        peer.signal(incomingCall.offer);
-
-        setActiveCall({
-          targetUserId: incomingCall.from,
-          targetUserName: incomingCall.fromName,
-          targetUserAvatar: incomingCall.fromAvatar,
-        });
-        setIncomingCall(null);
       });
+      localStreamRef.current = stream;
+
+      const peer = new SimplePeer({
+        initiator: false,
+        trickleIce: false,
+        stream: stream,
+      });
+
+      peerRef.current = peer;
+
+      peer.on('signal', async (answer) => {
+        try {
+          const callsRef = ref(database, `calls/${incomingCall.from}`);
+          await push(callsRef, {
+            type: 'answer',
+            fromId: currentUser.id,
+            answer: JSON.stringify(answer),
+          });
+        } catch (error) {
+          console.error('Error sending answer:', error);
+        }
+      });
+
+      peer.on('stream', (remoteStream) => {
+        console.log('Remote stream received');
+      });
+
+      peer.on('error', (err) => {
+        console.error('Peer error:', err);
+        endCall();
+      });
+
+      try {
+        peer.signal(JSON.parse(incomingCall.offer));
+      } catch (e) {
+        console.log('Offer parse error:', e);
+      }
+
+      setActiveCall({
+        targetUserId: incomingCall.from,
+        targetUserName: incomingCall.fromName,
+        targetUserAvatar: incomingCall.fromAvatar,
+      });
+      setIncomingCall(null);
+      setCallDuration(0);
     } catch (err) {
       alert('Microphone access denied');
     }
@@ -250,6 +381,7 @@ export default function ChatApp() {
     }
     setActiveCall(null);
     setIncomingCall(null);
+    setCallDuration(0);
   };
 
   // ============================================
@@ -264,7 +396,6 @@ export default function ChatApp() {
   // RENDER CHAT APP
   // ============================================
 
-  const conversationMessages = getConversationMessages();
   const selectedUserData = selectedUser ? USERS.find(u => u.id === selectedUser.id) : null;
 
   return (
@@ -283,6 +414,7 @@ export default function ChatApp() {
         <ActiveCallOverlay
           targetUser={USERS.find(u => u.id === activeCall.targetUserId)}
           onEndCall={endCall}
+          duration={callDuration}
         />
       )}
 
@@ -314,35 +446,38 @@ export default function ChatApp() {
               <span className="online-count">{onlineUsers.length} online</span>
             </div>
             <div className="users-list">
-              {USERS.filter(u => u.id !== currentUser.id).map(user => (
-                <div
-                  key={user.id}
-                  className={`user-item ${selectedUser?.id === user.id ? 'active' : ''}`}
-                  onClick={() => setSelectedUser(user)}
-                >
-                  <div className="user-avatar-container">
-                    <span className="user-avatar">{user.avatar}</span>
-                    <span className="online-indicator">🟢</span>
+              {USERS.filter(u => u.id !== currentUser.id).map(user => {
+                const isOnline = onlineUsers.includes(user.id);
+                return (
+                  <div
+                    key={user.id}
+                    className={`user-item ${selectedUser?.id === user.id ? 'active' : ''}`}
+                    onClick={() => setSelectedUser(user)}
+                  >
+                    <div className="user-avatar-container">
+                      <span className="user-avatar">{user.avatar}</span>
+                      <span className="online-indicator">{isOnline ? '🟢' : '⚪'}</span>
+                    </div>
+                    <div className="user-details">
+                      <p className="user-name">{user.name}</p>
+                      <p className="user-status">{isOnline ? 'Online' : 'Offline'}</p>
+                    </div>
+                    {selectedUser?.id === user.id && (
+                      <button
+                        className="call-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!activeCall && isOnline) initiateCall(user);
+                        }}
+                        disabled={activeCall || !isOnline}
+                        title={!isOnline ? 'User offline' : activeCall ? 'Call in progress' : 'Start voice call'}
+                      >
+                        📞
+                      </button>
+                    )}
                   </div>
-                  <div className="user-details">
-                    <p className="user-name">{user.name}</p>
-                    <p className="user-status">Online</p>
-                  </div>
-                  {selectedUser?.id === user.id && (
-                    <button
-                      className="call-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (!activeCall) initiateCall(user);
-                      }}
-                      disabled={activeCall ? true : false}
-                      title={activeCall ? 'Call in progress' : 'Start voice call'}
-                    >
-                      📞
-                    </button>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </aside>
 
@@ -356,7 +491,7 @@ export default function ChatApp() {
                     <span className="chat-avatar">{selectedUserData.avatar}</span>
                     <div>
                       <h2>{selectedUserData.name}</h2>
-                      <p className="chat-status">🟢 Online</p>
+                      <p className="chat-status">{onlineUsers.includes(selectedUserData.id) ? '🟢 Online' : '⚪ Offline'}</p>
                     </div>
                   </div>
                   <button className="clear-chat-btn" onClick={clearChat} title="Clear chat history">
@@ -366,17 +501,19 @@ export default function ChatApp() {
 
                 {/* MESSAGES */}
                 <div className="messages-container">
-                  {conversationMessages.length === 0 ? (
+                  {messages.length === 0 ? (
                     <div className="no-messages">
                       <p>No messages yet</p>
                       <p>Start the conversation!</p>
                     </div>
                   ) : (
-                    conversationMessages.map(msg => (
-                      <div key={msg.id} className={`message ${msg.senderId === currentUser.id ? 'sent' : 'received'}`}>
+                    messages.map((msg, idx) => (
+                      <div key={idx} className={`message ${msg.senderId === currentUser.id ? 'sent' : 'received'}`}>
                         <div className="message-bubble">
                           <p className="message-text">{msg.text}</p>
-                          <span className="message-time">{msg.timestamp}</span>
+                          <span className="message-time">
+                            {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                          </span>
                         </div>
                       </div>
                     ))
@@ -533,16 +670,7 @@ function IncomingCallNotification({ caller, onAccept, onReject }) {
 // ACTIVE CALL OVERLAY
 // ============================================
 
-function ActiveCallOverlay({ targetUser, onEndCall }) {
-  const [callDuration, setCallDuration] = useState(0);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setCallDuration(prev => prev + 1);
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
-
+function ActiveCallOverlay({ targetUser, onEndCall, duration }) {
   const formatDuration = (seconds) => {
     const hours = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
@@ -561,7 +689,7 @@ function ActiveCallOverlay({ targetUser, onEndCall }) {
           <span className="call-avatar">{targetUser.avatar}</span>
           <p className="call-label">In Call with</p>
           <p className="call-user">{targetUser.name}</p>
-          <p className="call-duration">{formatDuration(callDuration)}</p>
+          <p className="call-duration">{formatDuration(duration)}</p>
         </div>
         <button onClick={onEndCall} className="end-call-btn">
           📞
